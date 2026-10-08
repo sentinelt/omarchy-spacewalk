@@ -1249,6 +1249,12 @@ class Bridge:
                 error(f"heart rate strap: {exc}")
                 await asyncio.sleep(10.0)
                 continue
+            except Exception as exc:
+                # See connection_loop: an unexpected error ended the strap
+                # search for good, silently.
+                error(f"heart rate strap: {exc!r}")
+                await asyncio.sleep(10.0)
+                continue
             if treadmill_up:
                 misses += 1
                 self.publish_heart("idle")
@@ -1771,6 +1777,11 @@ class Bridge:
                     attempt = 0
             except (BleakError, asyncio.TimeoutError, OSError) as exc:
                 error(f"connection failed: {exc}")
+            except Exception as exc:
+                # Not every failure comes as a BleakError: dbus-fast raises a
+                # bare EOFError when BlueZ has already dropped the link. Letting
+                # it through ended the bridge without a word in the log.
+                error(f"connection failed: {exc!r}")
             if not found:
                 attempt += 1
             # A powered-off treadmill is the normal state, not a failure: after
