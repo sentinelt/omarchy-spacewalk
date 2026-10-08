@@ -131,6 +131,14 @@ has not received yet. Already persisted steps survive either restart.
 Regression checks: `python3 -m unittest -v test_spacewalk.py` (uses a fake
 bridge, temporary state and a local Unix socket; does not control the belt).
 
+## On D-Bus, for other desktops
+
+The same bridge can also run as a systemd user service on the D-Bus session
+bus, for desktops whose widgets talk D-Bus rather than a Unix socket — KDE
+Plasma's QML among them. `kde/install-service.sh` sets it up;
+[docs/dbus.md](docs/dbus.md) describes the interface and how to use it from
+QML.
+
 ## Who this is for
 
 Honestly — I built this for my own desk and don't expect anyone else to run

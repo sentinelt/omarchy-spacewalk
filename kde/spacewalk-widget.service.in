@@ -1,0 +1,22 @@
+# The treadmill bridge as a systemd user service, on the D-Bus session bus.
+# install-service.sh fills in @ROOT@ and puts this in ~/.config/systemd/user.
+[Unit]
+Description=Spacewalk treadmill bridge
+Documentation=file://@ROOT@/docs/dbus.md
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=io.github.ncr.Spacewalk
+ExecStart=/usr/bin/python3 @ROOT@/spacewalk-service.py --host --dbus
+Restart=on-failure
+RestartSec=3
+# The bridge saves counters and says goodbye to BlueZ on SIGTERM; a kill
+# leaves the link open and the treadmill silent.
+TimeoutStopSec=25
+KillMode=mixed
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target

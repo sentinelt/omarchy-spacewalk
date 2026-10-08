@@ -1,0 +1,7 @@
+# D-Bus activation: the first call to io.github.ncr.Spacewalk starts the
+# systemd user service. install-service.sh puts this in
+# ~/.local/share/dbus-1/services.
+[D-BUS Service]
+Name=io.github.ncr.Spacewalk
+Exec=/bin/false
+SystemdService=spacewalk-widget.service
