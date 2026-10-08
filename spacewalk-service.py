@@ -118,11 +118,15 @@ class Host:
         self.process = None
         self.args = None
         self.clients = set()
+        # Called with every event, in order: the D-Bus face keeps its state
+        # this way. A listener must not block.
+        self.listeners = []
         self.connections = set()
         self.cache = {}
         self.lock = asyncio.Lock()
         self.stopping = False
         self.supervisor = None
+        self.spawned = asyncio.Event()
 
     def publish(self, event):
         kind = event.get("t")
@@ -132,6 +136,8 @@ class Host:
             self.cache["data"] = {**self.cache.get("data", {}), **event}
         elif kind in ("status", "targets", "history", "belt", "phase", "server", "heart"):
             self.cache[kind] = event
+        for listener in tuple(self.listeners):
+            listener(event)
         encoded = (json.dumps(event) + "\n").encode()
         for queue in tuple(self.clients):
             # A stuck UI must never stall the treadmill's data or disk writes.
@@ -156,20 +162,54 @@ class Host:
             if self.args == args:
                 return
             # Settings changes are serialized; ordinary UI reloads do nothing.
-            if self.supervisor:
-                self.supervisor.cancel()
-                await self.stop_bridge()
-                await asyncio.gather(self.supervisor, return_exceptions=True)
             self.args = args
-            self.cache.clear()
             save_args(args)
-            self.supervisor = asyncio.create_task(self.run_bridge())
+            await self.respawn()
+
+    async def respawn(self):
+        """A fresh bridge with the current arguments. The caller holds the lock."""
+        if self.supervisor:
+            self.supervisor.cancel()
+            await self.stop_bridge()
+            await asyncio.gather(self.supervisor, return_exceptions=True)
+        self.cache.clear()
+        self.spawned.clear()
+        self.supervisor = asyncio.create_task(self.run_bridge())
+        # Return with the process started, so a command sent right after a
+        # settings change is not refused. A supervisor that dies first (no
+        # python?) must not leave us waiting forever.
+        spawned = asyncio.create_task(self.spawned.wait())
+        await asyncio.wait([spawned, self.supervisor], return_when=asyncio.FIRST_COMPLETED)
+        spawned.cancel()
+
+    async def restart(self):
+        """Restart the bridge, and with it the Bluetooth link, keeping the
+        settings. Unlike a crash this is no error, so none is reported.
+        Returns False before anything has configured a bridge."""
+        async with self.lock:
+            if self.stopping or self.args is None:
+                return False
+            await self.respawn()
+            return True
+
+    async def send(self, line):
+        """Hands one command line to the bridge. False when none is running."""
+        async with self.lock:
+            if not (self.process and self.process.returncode is None):
+                return False
+            try:
+                self.process.stdin.write(line if line.endswith(b"\n") else line + b"\n")
+                await self.process.stdin.drain()
+            except ConnectionError:
+                return False             # the bridge exited a moment ago
+            return True
 
     async def run_bridge(self):
         while not self.stopping:
             self.process = await asyncio.create_subprocess_exec(
                 sys.executable, str(BRIDGE), *self.args,
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+            self.spawned.set()
             while line := await self.process.stdout.readline():
                 try:
                     self.publish(json.loads(line))
@@ -196,10 +236,7 @@ class Host:
             self.clients.add(queue)
             sender = asyncio.create_task(send_events())
             while line := await reader.readline():
-                async with self.lock:
-                    if self.process and self.process.returncode is None:
-                        self.process.stdin.write(line)
-                        await self.process.stdin.drain()
+                await self.send(line)
         except (ValueError, KeyError, ConnectionError, asyncio.TimeoutError):
             pass
         finally:

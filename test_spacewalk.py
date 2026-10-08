@@ -459,6 +459,35 @@ for line in sys.stdin:
                     os.killpg(proc.pid, signal.SIGKILL)
                 await proc.wait()
 
+    async def test_restart_brings_a_new_bridge_without_an_error(self):
+        events = []
+        self.host.listeners.append(events.append)
+        self.assertFalse(await self.host.restart())      # nothing configured yet
+        r, w, event = await self.connect()
+        pid = event["pid"]
+        self.assertTrue(await self.host.restart())
+        for _ in range(50):
+            await asyncio.sleep(0.02)
+            if self.host.cache.get("data", {}).get("pid") not in (None, pid):
+                break
+        self.assertNotEqual(self.host.cache["data"]["pid"], pid)
+        self.assertEqual(self.host.args, [])
+        self.assertEqual([e for e in events if e["t"] == "error"], [])
+        w.close()
+        await w.wait_closed()
+
+    async def test_send_reaches_the_bridge_and_listeners_see_the_reply(self):
+        events = []
+        self.host.listeners.append(events.append)
+        self.assertFalse(await self.host.send(b"ping"))  # no bridge yet
+        await self.host.configure([])
+        self.assertTrue(await self.host.send(b"ping"))
+        for _ in range(50):
+            await asyncio.sleep(0.02)
+            if any(e["t"] == "echo" for e in events):
+                break
+        self.assertIn("ping", [e.get("command") for e in events if e["t"] == "echo"])
+
     async def test_backend_crash_restarts_without_panel(self):
         r, w, event = await self.connect()
         pid = event["pid"]
