@@ -694,6 +694,8 @@ class FakeClient:
 
     async def disconnect(self):
         self.is_connected = False
+        if FakeClient.disconnect_error:
+            raise FakeClient.disconnect_error
 
     async def __aenter__(self):
         await self.connect()
@@ -729,6 +731,7 @@ class LinkTests(StateDirTestCase, unittest.IsolatedAsyncioTestCase):
         self.addCleanup(setattr, bridge, "BleakClient", bridge.BleakClient)
         bridge.BleakClient = FakeClient
         FakeClient.retries = 2
+        FakeClient.disconnect_error = None
         self.bridge = bridge.Bridge(None, None, 0)
 
         async def find_device(patience=60.0):
@@ -759,6 +762,25 @@ class LinkTests(StateDirTestCase, unittest.IsolatedAsyncioTestCase):
         self.addCleanup(task.cancel)
         await asyncio.sleep(0.05)
         return task
+
+    async def test_failed_disconnect_of_a_dropped_link_is_not_an_error(self):
+        FakeClient.disconnect_error = EOFError()
+        task = asyncio.create_task(self.bridge.session())
+        await asyncio.sleep(0.05)
+        FakeClient.last.drop()
+        self.assertTrue(await asyncio.wait_for(task, 1))
+        self.assertEqual(self.errors(), [])
+        self.assertIn({"t": "status", "state": "disconnected"}, self.events)
+        self.assertIn({"t": "lifecycle", "event": "unclean-disconnect", "error": "EOFError()"},
+                      self.events)
+
+    async def test_failed_disconnect_of_a_dropped_strap_is_not_an_error(self):
+        FakeClient.disconnect_error = EOFError()
+        task = asyncio.create_task(self.bridge.heart_session(Device(), Device()))
+        await asyncio.sleep(0.05)
+        FakeClient.last.drop()
+        await asyncio.wait_for(task, 1)
+        self.assertEqual(self.bridge.heart_status["state"], "idle")
 
     def errors(self):
         return [e["msg"] for e in self.events if e["t"] == "error"]

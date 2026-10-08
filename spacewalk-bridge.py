@@ -26,6 +26,7 @@ Reads one command per line from stdin:
 import argparse
 import asyncio
 import collections
+import contextlib
 import fcntl
 import json
 import os
@@ -864,6 +865,25 @@ class LinkWatch:
             self.gone.set()
 
 
+@contextlib.asynccontextmanager
+async def link(client: BleakClient):
+    """`async with client`, except that taking the link down cannot fail.
+
+    When the other side has already dropped the link, bleak's disconnect call
+    often fails with a bare EOFError from dbus-fast (BlueZ: "No matching
+    connection for device") — every time on 2026-10-08. The link is gone
+    either way; the error only cut short the cleanup behind the session. It
+    goes to the log, not to the panel."""
+    await client.connect()
+    try:
+        yield client
+    finally:
+        try:
+            await client.disconnect()
+        except Exception as exc:
+            emit({"t": "lifecycle", "event": "unclean-disconnect", "error": repr(exc)})
+
+
 # ---------------------------------------------------------------- phone server
 
 def read_sessions() -> list[dict]:
@@ -1195,8 +1215,8 @@ class Bridge:
         watch = LinkWatch()
         gone = watch.gone
         try:
-            async with BleakClient(device, timeout=20.0,
-                                   disconnected_callback=watch.on_disconnect) as client:
+            async with link(BleakClient(device, timeout=20.0,
+                                        disconnected_callback=watch.on_disconnect)) as client:
                 watch.up = True
                 battery = None
                 try:
@@ -1728,8 +1748,8 @@ class Bridge:
         watch = LinkWatch()
 
         try:
-            async with BleakClient(device, timeout=30.0,
-                                   disconnected_callback=watch.on_disconnect) as client:
+            async with link(BleakClient(device, timeout=30.0,
+                                        disconnected_callback=watch.on_disconnect)) as client:
                 watch.up = True
                 self.client = client
                 self.has_control = False
@@ -1849,7 +1869,7 @@ class Bridge:
         tasks = [t for t in (stdin_task, conn_task, stop_task, save_task, heart_task, server_task) if t]
         for task in tasks:
             task.cancel()
-        # Cancelling the connection task unwinds `async with BleakClient`,
+        # Cancelling the connection task unwinds `async with link(...)`,
         # which asks BlueZ to drop the link. That takes a moment — leaving
         # before it is done keeps the link open just like a kill would.
         await asyncio.wait(tasks, timeout=5.0)
