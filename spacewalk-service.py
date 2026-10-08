@@ -184,6 +184,9 @@ class Host:
             await self.stop_bridge()
             await asyncio.gather(self.supervisor, return_exceptions=True)
         self.cache.clear()
+        # The old bridge's last words ("disconnected") are not read any more;
+        # say it here, or clients keep showing a link that is gone.
+        self.publish({"t": "status", "state": "starting"})
         self.spawned.clear()
         self.supervisor = asyncio.create_task(self.run_bridge())
         # Return with the process started, so a command sent right after a

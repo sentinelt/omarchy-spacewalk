@@ -466,6 +466,8 @@ for line in sys.stdin:
         self.assertFalse(await self.host.restart())      # nothing configured yet
         r, w, event = await self.connect()
         pid = event["pid"]
+        w.close()
+        await w.wait_closed()
         self.assertTrue(await self.host.restart())
         for _ in range(50):
             await asyncio.sleep(0.02)
@@ -474,8 +476,11 @@ for line in sys.stdin:
         self.assertNotEqual(self.host.cache["data"]["pid"], pid)
         self.assertEqual(self.host.args, [])
         self.assertEqual([e for e in events if e["t"] == "error"], [])
-        w.close()
-        await w.wait_closed()
+        # The old bridge's last "disconnected" is never read: the host has to
+        # say the link is down before the new bridge speaks, or clients keep
+        # showing the old link as connected.
+        statuses = [e["state"] for e in events if e["t"] == "status"]
+        self.assertEqual(statuses[-2:], ["starting", "connected"])
 
     async def test_send_reaches_the_bridge_and_listeners_see_the_reply(self):
         events = []
