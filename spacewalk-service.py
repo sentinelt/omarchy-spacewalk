@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import contextlib
 import fcntl
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,16 @@ SOCKET = RUNTIME / "bridge.sock"
 STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omarchy-spacewalk"
 BRIDGE = Path(__file__).with_name("spacewalk-bridge.py")
 MANIFEST = Path(__file__).with_name("manifest.json")
+DBUS = Path(__file__).with_name("spacewalk_dbus.py")
+
+
+def load_dbus():
+    """The D-Bus face, from next to this file — wherever Python was started
+    from. Loaded only when asked for: the Omarchy panel does without it."""
+    spec = importlib.util.spec_from_file_location("spacewalk_dbus", DBUS)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 async def ensure_service():
@@ -249,7 +260,9 @@ class Host:
             with contextlib.suppress(ConnectionError):
                 await writer.wait_closed()
 
-    async def run(self):
+    async def run(self, dbus=False):
+        """dbus: also serve the session bus (spacewalk_dbus.py), and run a
+        bridge with default settings until a client configures one."""
         RUNTIME.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(RUNTIME / "host.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w") as lock:
@@ -262,8 +275,14 @@ class Host:
             for sig in (signal.SIGTERM, signal.SIGINT):
                 loop.add_signal_handler(sig, stop.set)
             watcher = asyncio.create_task(watch_installation(stop))
+            bus = None
             try:
+                if dbus:
+                    bus = await load_dbus().serve(self)
                 saved = read_args()
+                if saved is None and dbus:
+                    # Nobody else starts the bridge; count steps from the start.
+                    saved = []
                 if saved is not None:
                     await self.configure(saved)
                 async with server:
@@ -284,6 +303,8 @@ class Host:
                     self.supervisor.cancel()
                     await asyncio.gather(self.supervisor, return_exceptions=True)
                 SOCKET.unlink(missing_ok=True)
+                if bus:
+                    bus.disconnect()
 
 
 async def client(args):
@@ -328,6 +349,11 @@ async def client(args):
 if __name__ == "__main__":
     os.umask(0o077)
     try:
-        asyncio.run(Host().run() if sys.argv[1:] == ["--host"] else client(sys.argv[1:]))
+        if sys.argv[1:2] == ["--host"]:
+            if sys.argv[2:] not in ([], ["--dbus"]):
+                sys.exit("usage: spacewalk-service.py --host [--dbus]")
+            asyncio.run(Host().run(dbus=sys.argv[2:] == ["--dbus"]))
+        else:
+            asyncio.run(client(sys.argv[1:]))
     except (BrokenPipeError, KeyboardInterrupt):
         pass

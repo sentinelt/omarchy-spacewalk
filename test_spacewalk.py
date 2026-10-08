@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import math
 import os
 import signal
 import sys
@@ -839,6 +840,253 @@ class LinkTests(StateDirTestCase, unittest.IsolatedAsyncioTestCase):
         task = await self.run_briefly(self.bridge.heart_loop())
         self.assertFalse(task.done())
         self.assertTrue(any("EOFError" in msg for msg in self.errors()), self.errors())
+
+
+FAKE_BRIDGE = '''import json, os, sys
+def say(**event):
+    print(json.dumps(event), flush=True)
+say(t="lifecycle", event="started", pid=os.getpid())
+say(t="history", days={"2026-10-07": {"steps": 5000, "distance_m": 3500, "kcal": 200, "elapsed_s": 3600}})
+say(t="targets", target_speed=None, target_incline=None)
+say(t="status", state="connected", device="URTM024", address="54:50:00:0D:E6:5A")
+say(t="data", day="2026-10-08", day_steps=10042, day_distance_m=7000, day_kcal=300,
+    day_elapsed_s=5000, pid=os.getpid())
+for line in sys.stdin:
+    command = line.split()
+    # Also on disk: what a bridge received just before it was replaced never
+    # reaches the host as an echo.
+    with open(os.path.join(os.path.dirname(__file__), "commands.log"), "a") as log:
+        log.write(line)
+    say(t="echo", command=line.strip(), pid=os.getpid())
+    if command[0] == "heart-series":
+        say(t="hr_series", reset=True, notes=[{"at": 100, "kind": "jump", "text": "x", "bpm": 130}])
+        say(t="hr_series", points=[[100, 120, 2.5, 3, 1], [101, 121, 2.5, 3, 1]])
+    elif command[0] == "speed":
+        say(t="targets", target_speed=float(command[1]), target_incline=3.0)
+    elif command[0] == "walk":         # test only: a reading from a moving belt
+        say(t="data", speed=2.5, incline=3.0, elapsed_s=60, day="2026-10-08", day_steps=10100,
+            day_distance_m=7040, day_kcal=303, day_elapsed_s=5060, pid=os.getpid())
+    elif command[0] == "beat":         # test only: a heart rate point at a given time
+        say(t="hr_point", point=[int(command[1]), 125, 2.5, 3, 1])
+'''
+
+BUS_CONFIG = '''<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:dir={dir}</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+'''
+
+
+async def until(predicate, timeout=3.0):
+    """Waits for predicate() — sync or async — to hold."""
+    deadline = time.monotonic() + timeout
+    while True:
+        value = predicate()
+        if asyncio.iscoroutine(value):
+            value = await value
+        if value:
+            return value
+        if time.monotonic() > deadline:
+            raise AssertionError("condition not met in time")
+        await asyncio.sleep(0.02)
+
+
+class DBusTests(unittest.IsolatedAsyncioTestCase):
+    """The D-Bus face against a private bus and a fake bridge."""
+
+    async def asyncSetUp(self):
+        from dbus_fast.aio import MessageBus
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        folder = Path(self.temp.name)
+        config = folder / "bus.conf"
+        config.write_text(BUS_CONFIG.format(dir=folder))
+        self.daemon = await asyncio.create_subprocess_exec(
+            "dbus-daemon", "--config-file", str(config), "--nofork", "--print-address=1",
+            stdout=asyncio.subprocess.PIPE)
+        self.address = (await asyncio.wait_for(self.daemon.stdout.readline(), 5)).decode().strip()
+
+        self.dbus = service.load_dbus()
+        service.STATE = folder
+        service.BRIDGE = folder / "fake-bridge.py"
+        service.BRIDGE.write_text(FAKE_BRIDGE)
+        self.host = service.Host()
+        self.events = []
+        self.host.listeners.append(self.events.append)
+        self.bus = await self.dbus.serve(self.host, self.address)
+        await self.host.configure([])
+
+        self.client = await MessageBus(bus_address=self.address).connect()
+        node = await self.client.introspect(self.dbus.BUS_NAME, self.dbus.OBJECT_PATH)
+        proxy = self.client.get_proxy_object(self.dbus.BUS_NAME, self.dbus.OBJECT_PATH, node)
+        self.iface = proxy.get_interface(self.dbus.INTERFACE)
+        self.props = proxy.get_interface("org.freedesktop.DBus.Properties")
+        await until(lambda: self.iface.get_day_steps())
+
+    async def asyncTearDown(self):
+        self.host.stopping = True
+        await self.host.stop_bridge()
+        if self.host.supervisor:
+            self.host.supervisor.cancel()
+            await asyncio.gather(self.host.supervisor, return_exceptions=True)
+        self.client.disconnect()
+        if self.bus.connected:
+            self.bus.disconnect()
+        self.daemon.terminate()
+        await self.daemon.wait()
+
+    def echoed(self):
+        return [e["command"] for e in self.events if e["t"] == "echo"]
+
+    async def test_properties_follow_the_bridge(self):
+        self.assertEqual(await self.iface.get_day_steps(), 10042)
+        self.assertEqual(await self.iface.get_day_distance_m(), 7000)
+        self.assertEqual(await self.iface.get_day(), "2026-10-08")
+        self.assertEqual(await self.iface.get_link_state(), "connected")
+        self.assertEqual(await self.iface.get_device(), "URTM024")
+        self.assertEqual(json.loads(await self.iface.get_history())["2026-10-07"]["steps"], 5000)
+        # The bridge knows no targets yet: NaN, not a made-up number.
+        self.assertTrue(math.isnan(await self.iface.get_target_speed()))
+        self.assertEqual(await self.iface.get_heart_battery(), -1)
+
+    async def test_changes_are_announced_once(self):
+        changes = []
+        self.props.on_properties_changed(lambda iface, changed, gone: changes.append(
+            {k: v.value for k, v in changed.items()}))
+        await self.host.send(b"walk")
+        await until(lambda: any("DaySteps" in c for c in changes))
+        merged = {k: v for c in changes for k, v in c.items()}
+        self.assertEqual(merged["DaySteps"], 10100)
+        self.assertEqual(merged["Speed"], 2.5)
+        self.assertEqual(merged["SessionElapsedS"], 60)
+        self.assertNotIn("Day", merged)               # unchanged values stay quiet
+
+    async def test_commands_reach_the_bridge(self):
+        await self.iface.call_start()
+        await self.iface.call_stop()
+        await self.iface.call_pause()
+        await self.iface.call_set_speed(2.5)
+        await self.iface.call_set_incline(3.0)
+        await until(lambda: "incline 3" in self.echoed())
+        self.assertEqual([c for c in self.echoed() if c != "heart-series"],
+                         ["start", "stop", "pause", "speed 2.5", "incline 3"])
+        self.assertEqual(await until(lambda: self.iface.get_target_speed()), 2.5)
+
+    async def test_bad_arguments_are_refused(self):
+        from dbus_fast import DBusError
+        for call in (self.iface.call_set_speed(math.nan), self.iface.call_set_speed(-1.0),
+                     self.iface.call_set_incline(math.inf),
+                     self.iface.call_configure(["--no-such-option"])):
+            with self.assertRaises(DBusError) as caught:
+                await call
+            self.assertEqual(caught.exception.type, "org.freedesktop.DBus.Error.InvalidArgs")
+        self.assertEqual(self.host.args, [])
+        self.assertEqual([c for c in self.echoed() if c != "heart-series"], [])
+
+    async def test_commands_without_a_bridge_are_refused(self):
+        from dbus_fast import DBusError
+        self.host.supervisor.cancel()
+        await self.host.stop_bridge()
+        with self.assertRaises(DBusError) as caught:
+            await self.iface.call_start()
+        self.assertEqual(caught.exception.type, self.dbus.NOT_RUNNING)
+
+    async def test_heart_chart(self):
+        # A started bridge is asked for the day's chart without anyone calling.
+        await until(lambda: "heart-series" in self.echoed())
+        series = json.loads(await until(self.chart_with_points))
+        self.assertEqual([p[0] for p in series["points"]], [100, 101])
+        self.assertEqual(series["notes"][0]["kind"], "jump")
+        points = []
+        self.iface.on_heart_point(lambda point: points.append(json.loads(point)))
+        await self.host.send(b"beat 101")       # already in the series: no repeat
+        await self.host.send(b"beat 102")
+        await until(lambda: points)
+        await asyncio.sleep(0.1)
+        self.assertEqual([p[0] for p in points], [102])
+        series = json.loads(await self.iface.call_get_heart_series())
+        self.assertEqual([p[0] for p in series["points"]], [100, 101, 102])
+
+    async def chart_with_points(self):
+        chart = await self.iface.call_get_heart_series()
+        return chart if json.loads(chart)["points"] else None
+
+    def bridge_pid(self):
+        return self.host.cache.get("data", {}).get("pid")
+
+    async def test_reconnect_restarts_the_bridge_quietly(self):
+        pid = self.bridge_pid()
+        await self.iface.call_reconnect()
+        await until(lambda: self.bridge_pid() not in (None, pid))
+        self.assertEqual(await self.iface.get_last_error(), "")
+        # Neither starts nor stops the belt: no command but the chart request.
+        await asyncio.sleep(0.1)
+        received = (Path(self.temp.name) / "commands.log").read_text().split()
+        self.assertEqual([c for c in received if c != "heart-series"], [])
+
+    async def test_configure_restarts_only_on_a_change(self):
+        pid = self.bridge_pid()
+        await self.iface.call_configure(["--address", "54:50:00:0D:E6:5A"])
+        self.assertEqual(self.host.args, ["--address", "54:50:00:0D:E6:5A"])
+        new_pid = await until(lambda: self.bridge_pid() not in (None, pid) and self.bridge_pid())
+        await self.iface.call_configure(["--address", "54:50:00:0D:E6:5A"])
+        await asyncio.sleep(0.2)
+        self.assertEqual(self.bridge_pid(), new_pid)
+
+    async def test_second_owner_is_refused(self):
+        with self.assertRaises(RuntimeError):
+            await self.dbus.serve(service.Host(), self.address)
+
+    async def test_host_runs_on_the_bus_until_terminated(self):
+        """Host.run(dbus=True) as systemd runs it: takes the name, starts a
+        bridge with default settings, and gives the name back on SIGTERM."""
+        folder = Path(self.temp.name) / "run"
+        folder.mkdir()
+        runner = folder / "host-runner.py"
+        runner.write_text("\n".join([
+            "import asyncio, importlib.util",
+            "from pathlib import Path",
+            f"spec = importlib.util.spec_from_file_location('host', {str(Path(service.__file__))!r})",
+            "host = importlib.util.module_from_spec(spec)",
+            "spec.loader.exec_module(host)",
+            f"host.RUNTIME = Path({str(folder)!r})",
+            f"host.SOCKET = Path({str(folder / 'bridge.sock')!r})",
+            f"host.STATE = Path({str(folder)!r})",
+            f"host.BRIDGE = Path({str(service.BRIDGE)!r})",
+            "asyncio.run(host.Host().run(dbus=True))",
+        ]))
+        # This test's own host holds the name; give it up for the runner.
+        self.bus.disconnect()
+        env = {**os.environ, "DBUS_SESSION_BUS_ADDRESS": self.address}
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(runner), env=env, start_new_session=True,
+            stderr=asyncio.subprocess.PIPE)
+        try:
+            from dbus_fast import Message
+            async def owner():
+                reply = await self.client.call(Message(
+                    destination="org.freedesktop.DBus", path="/org/freedesktop/DBus",
+                    interface="org.freedesktop.DBus", member="NameHasOwner",
+                    signature="s", body=[self.dbus.BUS_NAME]))
+                return reply.body[0]
+            await until(owner, 5)
+            self.assertEqual(await until(lambda: self.iface.get_day_steps(), 5), 10042)
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), 5)
+            self.assertEqual(proc.returncode, 0, (await proc.stderr.read()).decode())
+            self.assertFalse(await owner())
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            await proc.wait()
 
 
 if __name__ == "__main__":
