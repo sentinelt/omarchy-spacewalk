@@ -845,6 +845,25 @@ class Radio:
                 await self.sync()
 
 
+class LinkWatch:
+    """Tells when an established link ends.
+
+    BlueZ sometimes aborts a connection attempt ("le-connection-abort-by-local");
+    bleak then retries, and calls disconnected_callback once for every aborted
+    attempt — before it hands over the connection that finally worked. Taken at
+    face value, those calls ended the session right after it began: two
+    packets, then a disconnect (2026-10-08, two to four aborts per connect).
+    So a disconnect counts only once the link is up."""
+
+    def __init__(self):
+        self.up = False
+        self.gone = asyncio.Event()
+
+    def on_disconnect(self, _client):
+        if self.up:
+            self.gone.set()
+
+
 # ---------------------------------------------------------------- phone server
 
 def read_sessions() -> list[dict]:
@@ -1173,10 +1192,12 @@ class Bridge:
     async def heart_session(self, device, adv):
         name = adv.local_name or device.name or device.address
         self.publish_heart("connecting", device=name)
-        gone = asyncio.Event()
+        watch = LinkWatch()
+        gone = watch.gone
         try:
             async with BleakClient(device, timeout=20.0,
-                                   disconnected_callback=lambda _client: gone.set()) as client:
+                                   disconnected_callback=watch.on_disconnect) as client:
+                watch.up = True
                 battery = None
                 try:
                     battery = bytes(await client.read_gatt_char(BATTERY_LEVEL))[0]
@@ -1698,13 +1719,12 @@ class Bridge:
             return False
         address = device.address
         status("connecting", address=address)
-        disconnected = asyncio.Event()
-
-        def on_disconnect(_client):
-            disconnected.set()
+        watch = LinkWatch()
 
         try:
-            async with BleakClient(device, timeout=30.0, disconnected_callback=on_disconnect) as client:
+            async with BleakClient(device, timeout=30.0,
+                                   disconnected_callback=watch.on_disconnect) as client:
+                watch.up = True
                 self.client = client
                 self.has_control = False
                 # No new_session() here: the reference survives a reconnect on
@@ -1726,7 +1746,7 @@ class Bridge:
                     except BleakError as exc:
                         error(f"cannot subscribe to steps ({self.steps_uuid}): {exc}")
 
-                await disconnected.wait()
+                await watch.gone.wait()
 
         finally:
             self.client = None

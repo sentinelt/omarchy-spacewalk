@@ -673,5 +673,86 @@ class StaleTempTests(StateDirTestCase):
         self.assertEqual(list(self.dir.iterdir()), [])
 
 
+class FakeClient:
+    """BleakClient stand-in. When BlueZ aborts a connection attempt
+    ("le-connection-abort-by-local"), bleak retries it and calls
+    disconnected_callback once per aborted attempt — before it hands over the
+    connection. `retries` such attempts precede each connect."""
+    retries = 0
+    last = None
+
+    def __init__(self, device, timeout=None, disconnected_callback=None):
+        self.callback = disconnected_callback
+        self.is_connected = False
+        self.notified = []
+        FakeClient.last = self
+
+    async def connect(self):
+        for _ in range(FakeClient.retries):
+            self.callback(self)
+        self.is_connected = True
+
+    async def disconnect(self):
+        self.is_connected = False
+
+    async def __aenter__(self):
+        await self.connect()
+        return self
+
+    async def __aexit__(self, *exc):
+        await self.disconnect()
+
+    async def start_notify(self, uuid, handler):
+        self.notified.append(uuid)
+
+    async def read_gatt_char(self, uuid):
+        return bytearray([90])
+
+    def drop(self):
+        """The established link goes down."""
+        self.is_connected = False
+        self.callback(self)
+
+
+class Device:
+    address = "54:50:00:0D:E6:5A"
+    name = "URTM024"
+    local_name = "URTM024"
+
+
+class LinkTests(StateDirTestCase, unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        super().setUp()
+        self.events = []
+        self.addCleanup(setattr, bridge, "emit", bridge.emit)
+        bridge.emit = lambda obj, log=True: self.events.append(obj)
+        self.addCleanup(setattr, bridge, "BleakClient", bridge.BleakClient)
+        bridge.BleakClient = FakeClient
+        FakeClient.retries = 2
+        self.bridge = bridge.Bridge(None, None, 0)
+
+        async def find_device(patience=60.0):
+            return Device()
+        self.bridge.find_device = find_device
+
+    async def test_retried_connect_does_not_end_the_session(self):
+        task = asyncio.create_task(self.bridge.session())
+        await asyncio.sleep(0.05)
+        self.assertFalse(task.done())
+        self.assertIn(bridge.TREADMILL_DATA, FakeClient.last.notified)
+        FakeClient.last.drop()
+        self.assertTrue(await asyncio.wait_for(task, 1))
+        self.assertEqual(self.events[-1], {"t": "status", "state": "disconnected"})
+
+    async def test_retried_connect_does_not_end_the_strap_session(self):
+        task = asyncio.create_task(self.bridge.heart_session(Device(), Device()))
+        await asyncio.sleep(0.05)
+        self.assertFalse(task.done())
+        self.assertEqual(self.bridge.heart_status["state"], "connected")
+        FakeClient.last.drop()
+        await asyncio.wait_for(task, 1)
+        self.assertEqual(self.bridge.heart_status["state"], "idle")
+
+
 if __name__ == "__main__":
     unittest.main()
